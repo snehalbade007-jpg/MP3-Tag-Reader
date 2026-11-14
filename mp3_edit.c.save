@@ -1,0 +1,346 @@
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "main.h"
+
+#define HEADER_SIZE 10
+#define FRAME_HEADER_SIZE 10
+
+/* Convert a 4-byte synchsafe size to an integer */
+static unsigned int synchsafe_to_uint(const unsigned char *data)
+{
+    return ((unsigned int)(data[0] & 0x7F) << 21) |
+           ((unsigned int)(data[1] & 0x7F) << 14) |
+           ((unsigned int)(data[2] & 0x7F) << 7) |
+           (unsigned int)(data[3] & 0x7F);
+}
+
+/* Convert an integer to a 4-byte synchsafe size */
+static void uint_to_synchsafe(unsigned int size, unsigned char *data)
+{
+    data[0] = (size >> 21) & 0x7F;
+    data[1] = (size >> 14) & 0x7F;
+    data[2] = (size >> 7) & 0x7F;
+    data[3] = size & 0x7F;
+}
+
+/* Convert an integer to big-endian bytes */
+void LtoB_endian(unsigned int size, unsigned char *data)
+{
+    data[0] = (size >> 24) & 0xFF;
+    data[1] = (size >> 16) & 0xFF;
+    data[2] = (size >> 8) & 0xFF;
+    data[3] = size & 0xFF;
+}
+
+/* Validate the MP3 file */
+int validate_edit(char *file)
+{
+    FILE *fp = fopen(file, "rb");
+    unsigned char header[10];
+
+    if (fp == NULL)
+    {
+        printf("ERROR: Cannot open %s\n", file);
+        return 1;
+    }
+
+    if (fread(header, 1, 10, fp) != 10 ||
+        memcmp(header, "ID3", 3) != 0)
+    {
+        printf("ERROR: Valid ID3 metadata was not found.\n");
+        fclose(fp);
+        return 1;
+    }
+
+    fclose(fp);
+
+    if (strstr(file, ".mp3") == NULL)
+    {
+        printf("ERROR: Please provide an MP3 file.\n");
+        return 1;
+    }
+
+    return 0;
+}
+
+/* Find the ID3 frame corresponding to the edit option */
+static const char *get_frame_id(const char *option)
+{
+    if (strcmp(option, "-t") == 0)
+        return "TIT2";
+
+    if (strcmp(option, "-a") == 0)
+        return "TPE1";
+
+    if (strcmp(option, "-A") == 0)
+        return "TALB";
+
+    if (strcmp(option, "-y") == 0)
+        return "TDRC";
+
+    if (strcmp(option, "-g") == 0)
+        return "TCON";
+
+    if (strcmp(option, "-C") == 0)
+        return "TCOM";
+
+    return NULL;
+}
+
+/* Edit an MP3 metadata frame */
+int edit_data(char *option, char *new_data, char *file)
+{
+    const char *target = get_frame_id(option);
+
+    if (target == NULL)
+    {
+        printf("ERROR: Invalid option.\n");
+        printf("Use -t, -a, -A, -y, -g or -C.\n");
+        return 1;
+    }
+
+    FILE *fp = fopen(file, "rb");
+
+    if (fp == NULL)
+    {
+        printf("ERROR: Cannot open MP3 file.\n");
+        return 1;
+    }
+
+    unsigned char header[HEADER_SIZE];
+
+    if (fread(header, 1, HEADER_SIZE, fp) != HEADER_SIZE ||
+        memcmp(header, "ID3", 3) != 0)
+    {
+        printf("ERROR: Invalid ID3 header.\n");
+        fclose(fp);
+        return 1;
+    }
+
+    if (header[3] != 3 && header[3] != 4)
+    {
+        printf("ERROR: This editor supports ID3v2.3 and ID3v2.4.\n");
+        fclose(fp);
+        return 1;
+    }
+
+    unsigned int old_tag_size = synchsafe_to_uint(&header[6]);
+
+    unsigned char *tag = malloc(old_tag_size ? old_tag_size : 1);
+
+    if (tag == NULL)
+    {
+        printf("ERROR: Memory allocation failed.\n");
+        fclose(fp);
+        return 1;
+    }
+
+    if (fread(tag, 1, old_tag_size, fp) != old_tag_size)
+    {
+        printf("ERROR: Cannot read ID3 tag.\n");
+        free(tag);
+        fclose(fp);
+        return 1;
+    }
+
+    FILE *frames = tmpfile();
+
+    if (frames == NULL)
+    {
+        printf("ERROR: Cannot create temporary storage.\n");
+        free(tag);
+        fclose(fp);
+        return 1;
+    }
+
+    unsigned int offset = 0;
+    unsigned int new_tag_size = 0;
+    int found = 0;
+    int failed = 0;
+
+    while (offset + FRAME_HEADER_SIZE <= old_tag_size)
+    {
+        unsigned char frame_header[FRAME_HEADER_SIZE];
+
+        memcpy(frame_header, tag + offset, FRAME_HEADER_SIZE);
+
+        if (frame_header[0] == 0)
+            break;
+
+        unsigned int frame_size;
+
+        if (header[4] == 4)
+            frame_size = synchsafe_to_uint(&frame_header[4]);
+        else
+            frame_size = BtoL_endian(&frame_header[4]);
+
+        if (frame_size > old_tag_size - offset - FRAME_HEADER_SIZE)
+        {
+            printf("ERROR: Invalid frame size.\n");
+            failed = 1;
+            break;
+        }
+
+        if (memcmp(frame_header, target, 4) == 0)
+        {
+            unsigned int text_size = (unsigned int)strlen(new_data) + 1;
+            unsigned char *text = malloc(text_size);
+
+            if (text == NULL)
+            {
+                failed = 1;
+                break;
+            }
+
+            text[0] = 0;
+            memcpy(text + 1, new_data, text_size - 1);
+
+            if (header[4] == 4)
+                uint_to_synchsafe(text_size, &frame_header[4]);
+            else
+                LtoB_endian(text_size, &frame_header[4]);
+
+            if (fwrite(frame_header, 1, FRAME_HEADER_SIZE, frames)
+                    != FRAME_HEADER_SIZE ||
+                fwrite(text, 1, text_size, frames) != text_size)
+            {
+                failed = 1;
+            }
+
+            new_tag_size += FRAME_HEADER_SIZE + text_size;
+            free(text);
+            found = 1;
+        }
+        else
+        {
+            unsigned int total = FRAME_HEADER_SIZE + frame_size;
+
+            if (fwrite(tag + offset, 1, total, frames) != total)
+            {
+                failed = 1;
+                break;
+            }
+
+            new_tag_size += total;
+        }
+
+        offset += FRAME_HEADER_SIZE + frame_size;
+    }
+
+    /* Add the frame if it does not already exist */
+    if (!failed && !found)
+    {
+        unsigned int text_size = (unsigned int)strlen(new_data) + 1;
+        unsigned char frame_header[FRAME_HEADER_SIZE] = {0};
+
+        memcpy(frame_header, target, 4);
+
+        if (header[4] == 4)
+            uint_to_synchsafe(text_size, &frame_header[4]);
+        else
+            LtoB_endian(text_size, &frame_header[4]);
+
+        unsigned char encoding = 0;
+
+        if (fwrite(frame_header, 1, FRAME_HEADER_SIZE, frames)
+                != FRAME_HEADER_SIZE ||
+            fwrite(&encoding, 1, 1, frames) != 1 ||
+            fwrite(new_data, 1, text_size - 1, frames) != text_size - 1)
+        {
+            failed = 1;
+        }
+
+        new_tag_size += FRAME_HEADER_SIZE + text_size;
+    }
+
+    if (failed || new_tag_size > 0x0FFFFFFF)
+    {
+        printf("ERROR: Failed to prepare updated metadata.\n");
+        fclose(frames);
+        free(tag);
+        fclose(fp);
+        return 1;
+    }
+
+    char *temp_name = malloc(strlen(file) + 5);
+
+    if (temp_name == NULL)
+    {
+        fclose(frames);
+        free(tag);
+        fclose(fp);
+        return 1;
+    }
+
+    sprintf(temp_name, "%s.tmp", file);
+
+    FILE *out = fopen(temp_name, "wb");
+
+    if (out == NULL)
+    {
+        printf("ERROR: Cannot create output file.\n");
+        free(temp_name);
+        fclose(frames);
+        free(tag);
+        fclose(fp);
+        return 1;
+    }
+
+    uint_to_synchsafe(new_tag_size, &header[6]);
+
+    if (fwrite(header, 1, HEADER_SIZE, out) != HEADER_SIZE ||
+        fseek(frames, 0, SEEK_SET) != 0)
+    {
+        failed = 1;
+    }
+
+    unsigned char buffer[4096];
+    size_t count;
+
+    while (!failed && (count = fread(buffer, 1, sizeof(buffer), frames)) > 0)
+    {
+        if (fwrite(buffer, 1, count, out) != count)
+            failed = 1;
+    }
+
+    /* Copy the original audio data after the old ID3 tag */
+    while (!failed && (count = fread(buffer, 1, sizeof(buffer), fp)) > 0)
+    {
+        if (fwrite(buffer, 1, count, out) != count)
+            failed = 1;
+    }
+
+    if (ferror(fp) || ferror(frames))
+        failed = 1;
+
+    if (fclose(out) != 0)
+        failed = 1;
+
+    fclose(frames);
+    fclose(fp);
+    free(tag);
+
+    if (failed)
+    {
+        printf("ERROR: Failed to write updated MP3.\n");
+        remove(temp_name);
+        free(temp_name);
+        return 1;
+    }
+
+    if (rename(temp_name, file) != 0)
+    {
+        printf("ERROR: Could not replace original file.\n");
+        printf("Updated data may remain in %s\n", temp_name);
+        free(temp_name);
+        return 1;
+    }
+
+    free(temp_name);
+
+    printf("SUCCESS: %s updated successfully.\n", target);
+    return 0;
+}
+
